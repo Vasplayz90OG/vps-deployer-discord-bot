@@ -1,106 +1,253 @@
 # vps_manager.py
 import os
 import uuid
-import shlex
-import subprocess
+import random
+import string
 import time
 
-STORE = {}  # vps_id -> info
+try:
+    import docker
+except Exception:
+    docker = None
 
-# Requires tmate installed in the system / container
-# The tmate process will create a socket at /tmp/tmate-<id>.sock
-# We create a new detached session and read the tmate_ssh display
+STORE = {}  # id -> info
+SSH_BASE_PORT = int(os.getenv("SSH_BASE_PORT", "22000"))
+CREDITS = os.getenv("CREDITS", "Vasplayz90")
 
-def _run(cmd, timeout=10):
-    """Run shell command and return stdout (raises on failure)."""
-    proc = subprocess.run(cmd, capture_output=True, text=True, shell=False, timeout=timeout)
-    if proc.returncode != 0:
-        raise RuntimeError(f"Command failed: {cmd} -> {proc.stderr.strip()}")
-    return proc.stdout.strip()
 
-def create_vps(owner_id: str, os_image: str, ram: str, disk: str):
+def _rand_pass(n=12):
+    chars = string.ascii_letters + string.digits
+    return "".join(random.choice(chars) for _ in range(n))
+
+
+def _host_port():
+    # choose random offset to avoid collision
+    return SSH_BASE_PORT + random.randint(1, 2000)
+
+
+def _ensure_client():
+    if docker is None:
+        raise RuntimeError("docker SDK is not installed")
+    client = docker.from_env()
+    return client
+
+
+def create_vps(owner_id: str, image: str, ram: str, cpus: int, disk_label: str):
     """
-    Create a tmate session. Returns info:
-    {
-      id, ssh_command, host, user, port, backend
+    Create a Docker container as VPS.
+    - image: docker image name (must provide sshd or the code will try to set up sshd).
+    - ram: string like '2048m' or None
+    - cpus: integer number of cores
+    Returns info dict with id, username, passwords, host, port, direct_conn, ssh_command.
+    """
+    client = _ensure_client()
+    vid = uuid.uuid4().hex[:8]
+    host_port = _host_port()
+    user = "root"
+    root_password = _rand_pass(10)
+    user_password = _rand_pass(10)
+
+    # prepare container run args
+    run_kwargs = {
+        "image": image,
+        "detach": True,
+        "tty": True,
+        "name": f"vps_{vid}",
+        "labels": {"vps_id": vid, "owner": owner_id, "credits": CREDITS},
+        "ports": {"22/tcp": host_port},
     }
-    """
-    vps_id = uuid.uuid4().hex[:8]
-    sock = f"/tmp/tmate-{vps_id}.sock"
-    # Start a new detached tmate session using the socket
-    # 'tmate -S socket new-session -d'
-    try:
-        _run(["tmate", "-S", sock, "new-session", "-d"])
-    except Exception as e:
-        # maybe socket exists, try kill-server then new-session
+    if ram:
         try:
-            _run(["tmate", "-S", sock, "kill-server"])
+            # mem_limit takes strings like '512m' or '1g'
+            run_kwargs["mem_limit"] = ram
         except Exception:
             pass
-        _run(["tmate", "-S", sock, "new-session", "-d"])
-
-    # wait for tmate to be ready (tmate-ready)
-    start = time.time()
-    ready = False
-    while time.time() - start < 8:
+    if cpus and cpus > 0:
         try:
-            _run(["tmate", "-S", sock, "wait", "tmate-ready"], timeout=3)
-            ready = True
-            break
+            run_kwargs["nano_cpus"] = int(cpus * 1e9)
         except Exception:
-            time.sleep(0.5)
-    if not ready:
-        raise RuntimeError("tmate session didn't become ready in time")
+            pass
 
-    # get ssh string and web, prefer ssh
-    ssh_cmd = _run(["tmate", "-S", sock, "display", "-p", "#{tmate_ssh}"])
-    web_cmd = ""
+    # pull image (best-effort)
     try:
-        web_cmd = _run(["tmate", "-S", sock, "display", "-p", "#{tmate_web}"])
+        client.images.pull(image)
+    except Exception:
+        # continue; maybe image is local or pull fails
+        pass
+
+    # run container
+    container = client.containers.run(**run_kwargs)
+
+    # best-effort: set root password inside container
+    try:
+        # try chpasswd
+        cmd = f"bash -lc \"echo root:{root_password} | chpasswd || true\""
+        exec_id = client.api.exec_create(container.id, cmd)
+        client.api.exec_start(exec_id)
     except Exception:
         pass
 
-    # ssh_cmd looks like: 'ssh <user>@<host>'
-    # parse host and user
-    parts = ssh_cmd.strip().split()
-    user_host = parts[-1] if parts else ""
-    if "@" in user_host:
-        user, host = user_host.split("@", 1)
-    else:
-        user, host = user_host, ""
+    # try to create a regular user with password
+    try:
+        cmd = f"bash -lc \"useradd -m -s /bin/bash user || true && echo user:{user_password} | chpasswd || true\""
+        exec_id = client.api.exec_create(container.id, cmd)
+        client.api.exec_start(exec_id)
+    except Exception:
+        pass
+
+    # try to ensure sshd is running (many ssh-enabled images already run it)
+    try:
+        # attempt to start sshd if available
+        exec_id = client.api.exec_create(container.id, cmd="bash -lc 'service ssh start || /etc/init.d/ssh start || true'")
+        client.api.exec_start(exec_id)
+    except Exception:
+        pass
+
     info = {
-        "id": vps_id,
-        "ssh_command": ssh_cmd,
-        "web_command": web_cmd,
-        "host": host,
-        "user": user,
-        "port": 22,
-        "backend": "tmate",
-        "sock": sock
+        "id": vid,
+        "container_id": container.id,
+        "image": image,
+        "username": "user",
+        "user_password": user_password,
+        "root_password": root_password,
+        "host": os.getenv("HOST_IP", "127.0.0.1"),
+        "port": host_port,
+        "direct_conn": f"{os.getenv('HOST_IP','127.0.0.1')}:{host_port}",
+        "ssh_command": f"ssh user@{os.getenv('HOST_IP','127.0.0.1')} -p {host_port}",
+        "status": "running",
     }
-    STORE[vps_id] = info
+    STORE[vid] = info
     return info
 
-def delete_vps(vps_id: str):
-    info = STORE.get(vps_id)
+
+def delete_vps(vid: str):
+    client = _ensure_client()
+    info = STORE.get(vid)
     if not info:
         return False
-    sock = info.get("sock")
+    cid = info.get("container_id")
     try:
-        # try kill server for that socket
-        subprocess.run(["tmate", "-S", sock, "kill-server"], timeout=5)
+        c = client.containers.get(cid)
+        c.stop(timeout=5)
+        c.remove()
     except Exception:
         pass
-    try:
-        if os.path.exists(sock):
-            os.remove(sock)
-    except Exception:
-        pass
-    STORE.pop(vps_id, None)
+    STORE.pop(vid, None)
     return True
+
 
 def list_vps():
     return list(STORE.keys())
 
-def get_vps_info(vps_id: str):
-    return STORE.get(vps_id)
+
+def get_vps_info(vid: str):
+    return STORE.get(vid)
+
+
+def start_vps(vid: str):
+    client = _ensure_client()
+    info = STORE.get(vid)
+    if not info:
+        return False
+    try:
+        c = client.containers.get(info["container_id"])
+        c.start()
+        info["status"] = "running"
+        return True
+    except Exception:
+        return False
+
+
+def stop_vps(vid: str):
+    client = _ensure_client()
+    info = STORE.get(vid)
+    if not info:
+        return False
+    try:
+        c = client.containers.get(info["container_id"])
+        c.stop()
+        info["status"] = "stopped"
+        return True
+    except Exception:
+        return False
+
+
+def restart_vps(vid: str):
+    client = _ensure_client()
+    info = STORE.get(vid)
+    if not info:
+        return False
+    try:
+        c = client.containers.get(info["container_id"])
+        c.restart()
+        info["status"] = "running"
+        return True
+    except Exception:
+        return False
+
+
+def reinstall_vps(vid: str, image: str):
+    """
+    Reinstall: remove container and create new container under same vps id (best-effort).
+    Returns new info.
+    """
+    client = _ensure_client()
+    info = STORE.get(vid)
+    if not info:
+        raise RuntimeError("VPS not found")
+    # remove old container
+    try:
+        c = client.containers.get(info["container_id"])
+        c.stop()
+        c.remove()
+    except Exception:
+        pass
+    # create new container but keep same vps id
+    host_port = _host_port()
+    root_password = _rand_pass(10)
+    user_password = _rand_pass(10)
+    run_kwargs = {
+        "image": image,
+        "detach": True,
+        "tty": True,
+        "name": f"vps_{vid}",
+        "labels": {"vps_id": vid, "credits": CREDITS},
+        "ports": {"22/tcp": host_port},
+    }
+    try:
+        client.images.pull(image)
+    except Exception:
+        pass
+    container = client.containers.run(**run_kwargs)
+    try:
+        cmd1 = f"bash -lc \"echo root:{root_password} | chpasswd || true\""
+        exec_id = client.api.exec_create(container.id, cmd1)
+        client.api.exec_start(exec_id)
+    except Exception:
+        pass
+    try:
+        cmd2 = f"bash -lc \"useradd -m -s /bin/bash user || true && echo user:{user_password} | chpasswd || true\""
+        exec_id2 = client.api.exec_create(container.id, cmd2)
+        client.api.exec_start(exec_id2)
+    except Exception:
+        pass
+    try:
+        client.api.exec_create(container.id, cmd="bash -lc 'service ssh start || /etc/init.d/ssh start || true'")
+    except Exception:
+        pass
+
+    new_info = {
+        "id": vid,
+        "container_id": container.id,
+        "image": image,
+        "username": "user",
+        "user_password": user_password,
+        "root_password": root_password,
+        "host": os.getenv("HOST_IP", "127.0.0.1"),
+        "port": host_port,
+        "direct_conn": f"{os.getenv('HOST_IP','127.0.0.1')}:{host_port}",
+        "ssh_command": f"ssh user@{os.getenv('HOST_IP','127.0.0.1')} -p {host_port}",
+        "status": "running",
+    }
+    STORE[vid] = new_info
+    return new_info
