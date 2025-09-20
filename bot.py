@@ -1,362 +1,272 @@
-# bot.py
-import os
-import json
-import secrets
-from datetime import datetime
-from dotenv import load_dotenv
 import discord
-from discord import app_commands
 from discord.ext import commands
-from vps_manager import (
-    create_vps,
-    delete_vps,
-    list_vps,
-    get_vps_info,
-    start_vps,
-    stop_vps,
-    restart_vps,
-    reinstall_vps,
-)
+import asyncio
+import random
+import datetime
+import os
+from typing import Dict, List
+from config import Config
+from models import VPS
+from utils import generate_vps_id, send_dm_embed
 
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN missing in .env")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-CREDITS = os.getenv("CREDITS", "Vasplayz90")
-DEFAULT_IMAGE = os.getenv("DEFAULT_IMAGE", "rastasheep/ubuntu-sshd:22.04")
-DATA_FILE = "data.json"
-
-# persistent store
-if os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "r") as f:
-        DATA = json.load(f)
-else:
-    DATA = {"vps": {}, "admins": [], "banned_vps": [], "banned_users": []}
-
-
-def save_data():
-    with open(DATA_FILE, "w") as f:
-        json.dump(DATA, f, indent=2)
-
-
-def is_owner(user_id: int):
-    return user_id == OWNER_ID
-
-
-def is_admin(user_id: int):
-    return is_owner(user_id) or str(user_id) in DATA.get("admins", [])
-
-
+# Bot setup
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents.message_content = True
+bot = commands.Bot(command_prefix='/', intents=intents, help_command=None)
 
+# Mock data storage (in a real bot, you'd use a database)
+vps_instances = {}
+admins = {}
+user_vps = {}
 
 @bot.event
 async def on_ready():
-    activity = discord.Activity(type=discord.ActivityType.watching, name="ArizNodes Cloud By Vasplayz90")
-    await bot.change_presence(activity=activity)
-    print(f"✅ Bot online. Credits: {CREDITS}")
-    try:
-        await bot.tree.sync()
-    except Exception as e:
-        print("Warning: failed to sync commands:", e)
+    await bot.change_presence(activity=discord.Activity(
+        type=discord.ActivityType.watching, 
+        name=Config.STATUS_MESSAGE
+    ))
+    print(f'{bot.user} has logged in successfully!')
+    print(Config.STATUS_MESSAGE)
 
-
-# ---------------- Commands ----------------
-
-@bot.tree.command(name="deploy", description="Create a Docker-based VPS (default image). DMs credentials.")
-@app_commands.describe(
-    ram_mb="Memory in MB (example: 2048)",
-    cpu_cores="CPU cores (example: 2)",
-    disk_gb="Disk size label in GB (informational)",
-)
-async def deploy(interaction: discord.Interaction, ram_mb: int = 1024, cpu_cores: int = 1, disk_gb: int = 10):
-    await interaction.response.defer(ephemeral=True)
-    user = interaction.user
-    uid = str(user.id)
-    if uid in DATA.get("banned_users", []):
-        await interaction.followup.send("You are banned from creating VPS.", ephemeral=True)
+@bot.slash_command(name="deploy", description="Deploy a new VPS instance")
+async def deploy(
+    ctx, 
+    ram: discord.Option(int, description="RAM in GB", min_value=1, max_value=64),
+    disk: discord.Option(int, description="Disk space in GB", min_value=10, max_value=500),
+    cpu: discord.Option(int, description="CPU cores", min_value=1, max_value=16),
+    os: discord.Option(str, description="Operating System", 
+                      choices=Config.OS_OPTIONS, default="Docker")
+):
+    # Check if user is admin if admin system is enabled
+    if Config.ADMIN_ONLY_DEPLOY and ctx.author.id not in admins:
+        await ctx.respond("❌ You don't have permission to use this command.")
         return
+    
+    # Generate a unique VPS ID
+    vps_id = generate_vps_id()
+    while vps_id in vps_instances:
+        vps_id = generate_vps_id()
+    
+    # Create new VPS instance
+    new_vps = VPS(vps_id, ctx.author.id, ram, disk, cpu, os)
+    vps_instances[vps_id] = new_vps
+    
+    # Track user's VPS
+    if ctx.author.id not in user_vps:
+        user_vps[ctx.author.id] = []
+    user_vps[ctx.author.id].append(vps_id)
+    
+    # Send VPS details via DM
+    success = await send_dm_embed(ctx, new_vps)
+    if success:
+        await ctx.respond("✅ Your VPS has been deployed! Check your DMs for details.")
+    else:
+        # If DM fails, send in channel
+        embed = new_vps.get_deployment_embed()
+        await ctx.respond("✅ Your VPS has been deployed! I couldn't DM you, so here are your details:", embed=embed)
 
-    # create VPS with default image
-    try:
-        info = create_vps(
-            owner_id=uid,
-            image=DEFAULT_IMAGE,
-            ram=f"{ram_mb}m",
-            cpus=int(cpu_cores),
-            disk_label=f"{disk_gb}G",
-        )
-    except Exception as e:
-        await interaction.followup.send(f"Failed to create VPS: {e}", ephemeral=True)
+@bot.slash_command(name="deletevps", description="Delete your VPS instance")
+async def deletevps(
+    ctx, 
+    vps_id: discord.Option(str, description="ID of the VPS to delete")
+):
+    if vps_id not in vps_instances:
+        await ctx.respond("❌ VPS ID not found.")
         return
+        
+    vps = vps_instances[vps_id]
+    
+    # Check if user owns this VPS or is admin
+    if vps.owner_id != ctx.author.id and ctx.author.id not in admins:
+        await ctx.respond("❌ You can only delete your own VPS instances.")
+        return
+        
+    # Delete the VPS
+    del vps_instances[vps_id]
+    if ctx.author.id in user_vps and vps_id in user_vps[ctx.author.id]:
+        user_vps[ctx.author.id].remove(vps_id)
+    
+    await ctx.respond(f"✅ VPS {vps_id} has been deleted successfully.")
 
-    vps_id = info["id"]
-    DATA["vps"][vps_id] = {
-        "owner": uid,
-        "image": info.get("image", DEFAULT_IMAGE),
-        "ram_mb": ram_mb,
-        "cpu_cores": cpu_cores,
-        "disk_gb": disk_gb,
-        "created": datetime.utcnow().isoformat(),
-    }
-    save_data()
+@bot.slash_command(name="ban_vps", description="Ban a VPS instance (Admin only)")
+async def ban_vps(
+    ctx, 
+    vps_id: discord.Option(str, description="ID of the VPS to ban")
+):
+    if ctx.author.id not in admins:
+        await ctx.respond("❌ You need admin permissions to use this command.")
+        return
+        
+    if vps_id not in vps_instances:
+        await ctx.respond("❌ VPS ID not found.")
+        return
+        
+    # In a real implementation, this would actually ban the VPS
+    # For this mock implementation, we'll just delete it
+    vps = vps_instances[vps_id]
+    owner_id = vps.owner_id
+    
+    del vps_instances[vps_id]
+    if owner_id in user_vps and vps_id in user_vps[owner_id]:
+        user_vps[owner_id].remove(vps_id)
+    
+    await ctx.respond(f"✅ VPS {vps_id} has been banned and deleted.")
 
-    # Build embed DM with all requested fields and credit
+@bot.slash_command(name="list", description="List all your VPS instances")
+async def list_vps(ctx):
+    if ctx.author.id not in user_vps or not user_vps[ctx.author.id]:
+        await ctx.respond("❌ You don't have any VPS instances.")
+        return
+        
     embed = discord.Embed(
-        title="🎉 ArizNodes VPS Creation Successful",
-        description=f"**🆔 VPS ID**\n`{vps_id}`",
-        color=0x1abc9c,
-        timestamp=datetime.utcnow(),
+        title="Your VPS Instances",
+        color=0x7289DA,
+        timestamp=datetime.datetime.now()
     )
-    embed.add_field(name="💾 Memory", value=f"{ram_mb} MB", inline=True)
-    embed.add_field(name="⚡ CPU", value=f"{cpu_cores} cores", inline=True)
-    embed.add_field(name="💿 Disk", value=f"{disk_gb} GB (label)", inline=True)
-    embed.add_field(name="👤 Username", value=f"{info.get('username', 'root')}", inline=True)
-    embed.add_field(name="🔑 User Password", value=f"`{info.get('user_password', '—')}`", inline=True)
-    embed.add_field(name="🔑 Root Password", value=f"`{info.get('root_password', '—')}`", inline=True)
-    if info.get("ssh_command"):
-        embed.add_field(name="🔒 SSH Command", value=f"`{info['ssh_command']}`", inline=False)
-    embed.add_field(name="🔌 Direct connection", value=f"{info.get('direct_conn', 'host:port unknown')}", inline=False)
-    embed.add_field(
-        name="ℹ️ Note",
-        value="This is an ArizNodes VPS instance. You can install and configure additional packages as needed.",
-        inline=False,
-    )
-    embed.set_footer(text=f"Credits: {CREDITS} — Watching ArizNodes Cloud By Vasplayz90")
-
-    try:
-        await user.send(embed=embed)
-        await interaction.followup.send("VPS created — details sent to your DM.", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.followup.send("Could not DM you — enable DMs from server members.", ephemeral=True)
-
-
-@bot.tree.command(name="deletevps", description="Delete a VPS by ID (owner/admin can).")
-@app_commands.describe(vps_id="VPS ID to delete")
-async def deletevps(interaction: discord.Interaction, vps_id: str):
-    uid = str(interaction.user.id)
-    vmeta = DATA.get("vps", {}).get(vps_id)
-    if not vmeta:
-        await interaction.response.send_message("VPS not found.", ephemeral=True)
-        return
-    if vmeta["owner"] != uid and not is_admin(interaction.user.id):
-        await interaction.response.send_message("You don't have permission to delete this VPS.", ephemeral=True)
-        return
-    ok = delete_vps(vps_id)
-    if ok:
-        DATA["vps"].pop(vps_id, None)
-        save_data()
-        await interaction.response.send_message(f"VPS {vps_id} deleted.", ephemeral=True)
-    else:
-        await interaction.response.send_message("Failed to delete VPS from backend.", ephemeral=True)
-
-
-@bot.tree.command(name="ban_vps", description="Owner only: ban/unban a VPS ID.")
-@app_commands.describe(vps_id="VPS ID", ban="true to ban, false to unban")
-async def ban_vps(interaction: discord.Interaction, vps_id: str, ban: bool):
-    if not is_owner(interaction.user.id):
-        await interaction.response.send_message("Only owner can ban/unban vps.", ephemeral=True)
-        return
-    if ban:
-        DATA.setdefault("banned_vps", []).append(vps_id)
-        await interaction.response.send_message(f"VPS {vps_id} banned.", ephemeral=True)
-    else:
-        if vps_id in DATA.get("banned_vps", []):
-            DATA["banned_vps"].remove(vps_id)
-        await interaction.response.send_message(f"VPS {vps_id} unbanned.", ephemeral=True)
-    save_data()
-
-
-@bot.tree.command(name="list", description="List VPS (owner/admin see all, members see own).")
-async def list_cmd(interaction: discord.Interaction):
-    uid = str(interaction.user.id)
-    lines = []
-    for vid, m in DATA.get("vps", {}).items():
-        if m["owner"] == uid or is_admin(interaction.user.id):
-            lines.append(
-                f"`{vid}` — owner: <@{m['owner']}> — OS image: `{m.get('image')}` — RAM: {m.get('ram_mb')}MB — CPU: {m.get('cpu_cores')} cores"
+    
+    for vps_id in user_vps[ctx.author.id]:
+        if vps_id in vps_instances:
+            vps = vps_instances[vps_id]
+            embed.add_field(
+                name=f"VPS {vps_id}",
+                value=vps.get_short_info(),
+                inline=False
             )
-    if not lines:
-        await interaction.response.send_message("No VPS found.", ephemeral=True)
-    else:
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    
+    embed.set_footer(text=Config.FOOTER_TEXT)
+    await ctx.respond(embed=embed)
 
-
-@bot.tree.command(name="add_admin", description="Owner only: add admin by Discord ID.")
-@app_commands.describe(user_id="Discord user ID to add as admin")
-async def add_admin(interaction: discord.Interaction, user_id: str):
-    if not is_owner(interaction.user.id):
-        await interaction.response.send_message("Only owner can add admins.", ephemeral=True)
+@bot.slash_command(name="add_admin", description="Add an admin (Owner only)")
+async def add_admin(
+    ctx, 
+    user: discord.Option(discord.User, description="User to make admin")
+):
+    # Only the bot owner can add admins
+    if ctx.author.id != Config.BOT_OWNER_ID:
+        await ctx.respond("❌ Only the bot owner can add admins.")
         return
-    if user_id in DATA.get("admins", []):
-        await interaction.response.send_message("User already admin.", ephemeral=True)
+        
+    admins[user.id] = True
+    await ctx.respond(f"✅ {user.mention} has been added as an admin.")
+
+@bot.slash_command(name="manage", description="Manage your VPS instance")
+async def manage_vps(
+    ctx, 
+    vps_id: discord.Option(str, description="ID of the VPS to manage"),
+    action: discord.Option(str, description="Action to perform", 
+                          choices=["Start", "Stop", "Restart", "Reinstall OS", "Info"])
+):
+    if vps_id not in vps_instances:
+        await ctx.respond("❌ VPS ID not found.")
         return
-    DATA.setdefault("admins", []).append(user_id)
-    save_data()
-    await interaction.response.send_message(f"Added admin {user_id}.", ephemeral=True)
-
-
-@bot.tree.command(name="manage_vps", description="Manage a VPS (Start / Stop / Restart / Reinstall OS).")
-@app_commands.describe(vps_id="VPS ID to manage")
-async def manage_vps(interaction: discord.Interaction, vps_id: str):
-    uid = str(interaction.user.id)
-    meta = DATA.get("vps", {}).get(vps_id)
-    if not meta:
-        await interaction.response.send_message("VPS not found.", ephemeral=True)
+        
+    vps = vps_instances[vps_id]
+    
+    # Check if user owns this VPS
+    if vps.owner_id != ctx.author.id and ctx.author.id not in admins:
+        await ctx.respond("❌ You can only manage your own VPS instances.")
         return
-    if meta["owner"] != uid and not is_admin(interaction.user.id):
-        await interaction.response.send_message("You don't have permission.", ephemeral=True)
+        
+    # Perform the requested action
+    if action == "Start":
+        vps.status = "Running"
+        await ctx.respond(f"✅ VPS {vps_id} has been started.")
+    elif action == "Stop":
+        vps.status = "Stopped"
+        await ctx.respond(f"✅ VPS {vps_id} has been stopped.")
+    elif action == "Restart":
+        vps.status = "Restarting"
+        await ctx.respond(f"✅ VPS {vps_id} is restarting...")
+        await asyncio.sleep(2)  # Simulate restart time
+        vps.status = "Running"
+        await ctx.edit(content=f"✅ VPS {vps_id} has been restarted.")
+    elif action == "Reinstall OS":
+        # In a real implementation, this would reinstall the OS
+        await ctx.respond(f"✅ VPS {vps_id} is being reinstalled...")
+        await asyncio.sleep(3)  # Simulate reinstall time
+        await ctx.edit(content=f"✅ VPS {vps_id} has been reinstalled with {vps.os}.")
+    elif action == "Info":
+        await ctx.respond(embed=vps.get_info_embed())
+
+@bot.slash_command(name="clear", description="Clear all your VPS instances")
+async def clear_vps(ctx):
+    if ctx.author.id not in user_vps or not user_vps[ctx.author.id]:
+        await ctx.respond("❌ You don't have any VPS instances to clear.")
         return
-
-    info = get_vps_info(vps_id)
-    if not info:
-        await interaction.response.send_message("Backend info not found for this VPS.", ephemeral=True)
-        return
-
-    # Build status embed
-    status = info.get("status", "unknown")
-    embed = discord.Embed(title=f"Manage VPS `{vps_id}`", color=0x3498db)
-    embed.add_field(name="Status", value=f"🟢 Running" if status == "running" else f"🔴 {status}", inline=False)
-    embed.add_field(name="Memory", value=f"{meta.get('ram_mb')} MB", inline=True)
-    embed.add_field(name="CPU", value=f"{meta.get('cpu_cores')} cores", inline=True)
-    embed.add_field(name="Disk", value=f"{meta.get('disk_gb')} GB", inline=True)
-    embed.add_field(name="Username", value=info.get("username", "root"), inline=True)
-    embed.add_field(name="Created", value=meta.get("created", "unknown"), inline=True)
-    embed.add_field(name="OS image", value=meta.get("image"), inline=False)
-    embed.set_footer(text=f"Credits: {CREDITS} — Watching ArizNodes Cloud By Vasplayz90")
-
-    # send ephemeral response and DM full details
-    await interaction.response.send_message("Opening management DM with actions...", ephemeral=True)
-
-    # DM with action instructions and examples
-    user = interaction.user
-    dm = (
-        f"Manage VPS `{vps_id}`\n"
-        f"Use these commands in server or DM:\n"
-        f"/start_vps {vps_id}\n"
-        f"/stop_vps {vps_id}\n"
-        f"/restart_vps {vps_id}\n"
-        f"/reinstall_vps {vps_id} <choice>\n\n"
-        f"Reinstall choices: `docker` (default), `ubuntu_22_04`, `debian_12`, `chatgpt_choice`.\n\n"
-        f"Example Status:\n"
-        f"🟢 Running\n"
-        f"Memory: {meta.get('ram_mb')}MB\n"
-        f"CPU: {meta.get('cpu_cores')} cores\n"
-        f"Disk: {meta.get('disk_gb')}GB\n"
-        f"Username: {info.get('username','root')}\n"
-        f"Created: {meta.get('created')}\n"
-        f"OS: {meta.get('image')}\n"
+        
+    # Confirm before clearing
+    confirm_embed = discord.Embed(
+        title="⚠️ Confirm Clear All VPS",
+        description="This will delete ALL your VPS instances. This action cannot be undone.",
+        color=0xff9900
     )
-
+    confirm_embed.set_footer(text="Type 'confirm' to proceed or anything else to cancel.")
+    
+    await ctx.respond(embed=confirm_embed)
+    
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel
+    
     try:
-        await user.send(embed=embed)
-        await user.send(dm)
-    except discord.Forbidden:
-        await interaction.followup.send("Cannot DM you — enable DMs from server members.", ephemeral=True)
+        msg = await bot.wait_for('message', timeout=30.0, check=check)
+        if msg.content.lower() != 'confirm':
+            await ctx.respond("❌ Clear operation cancelled.")
+            return
+            
+        # Delete all user's VPS instances
+        for vps_id in user_vps[ctx.author.id][:]:
+            if vps_id in vps_instances:
+                del vps_instances[vps_id]
+        user_vps[ctx.author.id] = []
+        
+        await ctx.respond("✅ All your VPS instances have been deleted.")
+    except asyncio.TimeoutError:
+        await ctx.respond("❌ Clear operation timed out.")
 
+@bot.slash_command(name="help", description="Show help information")
+async def help_cmd(ctx):
+    embed = discord.Embed(
+        title="ArizNodes VPS Bot Help",
+        description="Manage your VPS instances directly from Discord!",
+        color=0x7289DA
+    )
+    
+    embed.add_field(
+        name="Available Commands",
+        value=(
+            "`/deploy` - Create a new VPS instance\n"
+            "`/deletevps` - Delete your VPS instance\n"
+            "`/ban_vps` - Ban a VPS instance (Admin only)\n"
+            "`/list` - List all your VPS instances\n"
+            "`/add_admin` - Add an admin (Owner only)\n"
+            "`/manage` - Manage your VPS instance\n"
+            "`/clear` - Clear all your VPS instances\n"
+            "`/help` - Show this help message"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="Features",
+        value=(
+            "• Choose RAM, CPU, Disk, and OS options\n"
+            "• Start, Stop, Restart your VPS\n"
+            "• Reinstall OS with different options\n"
+            "• Direct connection details\n"
+            "• Tmate session for SSH access"
+        ),
+        inline=False
+    )
+    
+    embed.set_footer(text=Config.FOOTER_TEXT)
+    await ctx.respond(embed=embed)
 
-# Operational commands for buttons
-@bot.tree.command(name="start_vps", description="Start a stopped VPS")
-@app_commands.describe(vps_id="VPS ID to start")
-async def start_vps_cmd(interaction: discord.Interaction, vps_id: str):
-    uid = str(interaction.user.id)
-    meta = DATA.get("vps", {}).get(vps_id)
-    if not meta:
-        await interaction.response.send_message("VPS not found.", ephemeral=True)
-        return
-    if meta["owner"] != uid and not is_admin(interaction.user.id):
-        await interaction.response.send_message("You don't have permission.", ephemeral=True)
-        return
-    ok = start_vps(vps_id)
-    await interaction.response.send_message("Started." if ok else "Failed to start.", ephemeral=True)
-
-
-@bot.tree.command(name="stop_vps", description="Stop a running VPS")
-@app_commands.describe(vps_id="VPS ID to stop")
-async def stop_vps_cmd(interaction: discord.Interaction, vps_id: str):
-    uid = str(interaction.user.id)
-    meta = DATA.get("vps", {}).get(vps_id)
-    if not meta:
-        await interaction.response.send_message("VPS not found.", ephemeral=True)
-        return
-    if meta["owner"] != uid and not is_admin(interaction.user.id):
-        await interaction.response.send_message("You don't have permission.", ephemeral=True)
-        return
-    ok = stop_vps(vps_id)
-    await interaction.response.send_message("Stopped." if ok else "Failed to stop.", ephemeral=True)
-
-
-@bot.tree.command(name="restart_vps", description="Restart a VPS")
-@app_commands.describe(vps_id="VPS ID to restart")
-async def restart_vps_cmd(interaction: discord.Interaction, vps_id: str):
-    uid = str(interaction.user.id)
-    meta = DATA.get("vps", {}).get(vps_id)
-    if not meta:
-        await interaction.response.send_message("VPS not found.", ephemeral=True)
-        return
-    if meta["owner"] != uid and not is_admin(interaction.user.id):
-        await interaction.response.send_message("You don't have permission.", ephemeral=True)
-        return
-    ok = restart_vps(vps_id)
-    await interaction.response.send_message("Restarted." if ok else "Failed to restart.", ephemeral=True)
-
-
-@bot.tree.command(name="reinstall_vps", description="Reinstall OS on the VPS (owner/admin).")
-@app_commands.describe(vps_id="VPS ID", choice="Choice: docker, ubuntu_22_04, debian_12, chatgpt_choice")
-async def reinstall_vps_cmd(interaction: discord.Interaction, vps_id: str, choice: str):
-    uid = str(interaction.user.id)
-    meta = DATA.get("vps", {}).get(vps_id)
-    if not meta:
-        await interaction.response.send_message("VPS not found.", ephemeral=True)
-        return
-    if meta["owner"] != uid and not is_admin(interaction.user.id):
-        await interaction.response.send_message("You don't have permission.", ephemeral=True)
-        return
-
-    choice_map = {
-        "docker": os.getenv("DEFAULT_IMAGE", DEFAULT_IMAGE),
-        "ubuntu_22_04": "rastasheep/ubuntu-sshd:22.04",
-        "debian_12": "rastasheep/debian-sshd:12",
-        "chatgpt_choice": "ubuntu:22.04",
-    }
-    image = choice_map.get(choice.lower())
-    if not image:
-        await interaction.response.send_message("Invalid choice. Use: docker, ubuntu_22_04, debian_12, chatgpt_choice", ephemeral=True)
-        return
-
-    try:
-        new_info = reinstall_vps(vps_id, image=image)
-    except Exception as e:
-        await interaction.response.send_message(f"Reinstall failed: {e}", ephemeral=True)
-        return
-
-    # update stored metadata
-    DATA["vps"][vps_id]["image"] = image
-    save_data()
-    await interaction.response.send_message(f"Reinstalled {vps_id} with image `{image}`. Check DM for details.", ephemeral=True)
-    try:
-        await interaction.user.send(f"VPS {vps_id} reinstalled with image `{image}`. New access: {new_info.get('direct_conn','unknown')}")
-    except discord.Forbidden:
-        pass
-
-
-@bot.tree.command(name="clear", description="Owner only: delete all VPS (dangerous).")
-async def clear_cmd(interaction: discord.Interaction):
-    if not is_owner(interaction.user.id):
-        await interaction.response.send_message("Only owner can clear all VPS.", ephemeral=True)
-        return
-    vids = list(DATA.get("vps", {}).keys())
-    failed = []
-    for v in vids:
-        if not delete_vps(v):
-            failed.append(v)
-        else:
-            DATA["vps"].pop(v, None)
-    save_data()
-    await interaction.response.send_message(f"Cleared. Failed: {failed}", ephemeral=True)
-
-
+# Run the bot
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    token = os.getenv('DISCORD_BOT_TOKEN')
+    if not token:
+        print("Error: DISCORD_BOT_TOKEN environment variable not set.")
+        print("Please set your bot token before running the bot.")
+        exit(1)
+        
+    bot.run(token)
