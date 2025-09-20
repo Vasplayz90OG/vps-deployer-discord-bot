@@ -12,15 +12,32 @@ A Discord bot for managing VPS instances directly from Discord.
 
 ## Setup
 
-1. Clone this repository
-2. Install dependencies: `pip install -r requirements.txt`
+### Automatic Setup (Linux/Mac)
+1. Run the setup script: `chmod +x setup.sh && ./setup.sh`
+2. Edit the `.env` file with your Discord bot token
+3. Run the bot: `python3 bot.py`
+
+### Automatic Setup (Windows)
+1. Run the batch file: `run.bat`
+2. Edit the `.env` file with your Discord bot token
+3. Run the bot: `python bot.py`
+
+### Manual Setup
+1. Install Python 3.8 or higher
+2. Install requirements: `pip install -r requirements.txt`
 3. Copy `.env.example` to `.env` and fill in your details
-4. Run the bot: `python bot.py`
+4. Run the bot: `python3 bot.py`
 
-## Docker Setup
+## Creating a Discord Bot
 
-1. Copy `.env.example` to `.env` and fill in your details
-2. Build and run: `docker-compose up -d`
+1. Go to https://discord.com/developers/applications
+2. Create a new application
+3. Go to the Bot section and create a bot
+4. Copy the bot token and add it to the `.env` file
+5. Enable the following intents:
+   - Message Content Intent
+   - Server Members Intent
+   - Presence Intent
 
 ## Commands
 
