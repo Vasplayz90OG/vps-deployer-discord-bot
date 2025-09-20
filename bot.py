@@ -5,28 +5,108 @@ import random
 import datetime
 import os
 from typing import Dict, List
-from config import Config
-from models import VPS
-from utils import generate_vps_id, send_dm_embed
 
 # Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='/', intents=intents, help_command=None)
 
+# Configuration
+BOT_OWNER_ID = int(os.getenv('BOT_OWNER_ID', 0))
+ADMIN_ONLY_DEPLOY = os.getenv('ADMIN_ONLY_DEPLOY', 'False').lower() == 'true'
+STATUS_MESSAGE = os.getenv('STATUS_MESSAGE', 'Watching ArizNodes Cloud By Vasplayz90 🚀🚀')
+FOOTER_TEXT = os.getenv('FOOTER_TEXT', 'ArizNodes Cloud By Vasplayz90 🚀🚀')
+OS_OPTIONS = ["Docker", "Ubuntu 22.04", "Debian 12", "CentOS 9", "AlmaLinux 9", "Rocky Linux 9"]
+
 # Mock data storage (in a real bot, you'd use a database)
 vps_instances = {}
 admins = {}
 user_vps = {}
 
+class VPS:
+    def __init__(self, vps_id, owner_id, ram, disk, cpu, os="Docker"):
+        self.id = vps_id
+        self.owner_id = owner_id
+        self.ram = ram
+        self.disk = disk
+        self.cpu = cpu
+        self.os = os
+        self.status = "Running"  # Can be Running, Stopped, Restarting
+        self.created_at = datetime.datetime.now()
+        self.username = f"user{random.randint(1000, 9999)}"
+        self.password = f"pass{random.randint(10000, 99999)}"
+        self.root_password = f"root{random.randint(10000, 99999)}"
+        self.ip = f"192.168.{random.randint(0, 255)}.{random.randint(1, 254)}"
+        self.tmate_session = f"tmate-{random.randint(100000000, 999999999)}"
+
+    def get_info_embed(self):
+        embed = discord.Embed(
+            title=f"VPS Information - ID: {self.id}",
+            color=0x00ff00 if self.status == "Running" else 0xff0000,
+            timestamp=datetime.datetime.now()
+        )
+        embed.add_field(name="Status", value=self.status, inline=True)
+        embed.add_field(name="Memory", value=f"{self.ram}GB", inline=True)
+        embed.add_field(name="CPU", value=f"{self.cpu} cores", inline=True)
+        embed.add_field(name="Disk", value=f"{self.disk}GB", inline=True)
+        embed.add_field(name="OS", value=self.os, inline=True)
+        embed.add_field(name="Username", value=self.username, inline=True)
+        embed.add_field(name="User Password", value=self.password, inline=True)
+        embed.add_field(name="Root Password", value=self.root_password, inline=True)
+        embed.add_field(name="IP Address", value=self.ip, inline=True)
+        embed.add_field(name="Created", value=self.created_at.strftime("%Y-%m-%d %H:%M:%S"), inline=True)
+        embed.add_field(name="Tmate Session", value=self.tmate_session, inline=False)
+        embed.set_footer(text=FOOTER_TEXT)
+        return embed
+
+    def get_deployment_embed(self):
+        embed = discord.Embed(
+            title="🎉 ArizNodes VPS Creation Successful",
+            color=0x00ff00,
+            timestamp=datetime.datetime.now()
+        )
+        embed.add_field(name="🆔 VPS ID", value=self.id, inline=True)
+        embed.add_field(name="💾 Memory", value=f"{self.ram}GB", inline=True)
+        embed.add_field(name="⚡ CPU", value=f"{self.cpu} cores", inline=True)
+        embed.add_field(name="💿 Disk", value=f"{self.disk}GB", inline=True)
+        embed.add_field(name="👤 Username", value=self.username, inline=True)
+        embed.add_field(name="🔑 User Password", value=self.password, inline=True)
+        embed.add_field(name="🔑 Root Password", value=self.root_password, inline=True)
+        embed.add_field(name="🔒 Tmate Session", value=self.tmate_session, inline=True)
+        embed.add_field(name="🔌 Direct Connection", value=self.ip, inline=True)
+        embed.add_field(
+            name="ℹ️ Note", 
+            value="This is a ArizNodes VPS instance. You can install and configure additional packages as needed.",
+            inline=False
+        )
+        embed.set_footer(text=FOOTER_TEXT)
+        return embed
+
+    def get_short_info(self):
+        status_emoji = "🟢" if self.status == "Running" else "🔴"
+        return f"{status_emoji} {self.id} | {self.ram}GB RAM | {self.cpu} CPU | {self.disk}GB Disk | {self.os}"
+
+def generate_vps_id():
+    """Generate a unique VPS ID"""
+    return f"vps{random.randint(10000, 99999)}"
+
+async def send_dm_embed(ctx, vps):
+    """Send VPS details via DM to user"""
+    try:
+        embed = vps.get_deployment_embed()
+        await ctx.author.send(embed=embed)
+        return True
+    except discord.Forbidden:
+        return False
+
 @bot.event
 async def on_ready():
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.watching, 
-        name=Config.STATUS_MESSAGE
+        name=STATUS_MESSAGE
     ))
     print(f'{bot.user} has logged in successfully!')
-    print(Config.STATUS_MESSAGE)
+    print(STATUS_MESSAGE)
 
 @bot.slash_command(name="deploy", description="Deploy a new VPS instance")
 async def deploy(
@@ -35,10 +115,10 @@ async def deploy(
     disk: discord.Option(int, description="Disk space in GB", min_value=10, max_value=500),
     cpu: discord.Option(int, description="CPU cores", min_value=1, max_value=16),
     os: discord.Option(str, description="Operating System", 
-                      choices=Config.OS_OPTIONS, default="Docker")
+                      choices=OS_OPTIONS, default="Docker")
 ):
     # Check if user is admin if admin system is enabled
-    if Config.ADMIN_ONLY_DEPLOY and ctx.author.id not in admins:
+    if ADMIN_ONLY_DEPLOY and ctx.author.id not in admins:
         await ctx.respond("❌ You don't have permission to use this command.")
         return
     
@@ -133,7 +213,7 @@ async def list_vps(ctx):
                 inline=False
             )
     
-    embed.set_footer(text=Config.FOOTER_TEXT)
+    embed.set_footer(text=FOOTER_TEXT)
     await ctx.respond(embed=embed)
 
 @bot.slash_command(name="add_admin", description="Add an admin (Owner only)")
@@ -142,7 +222,7 @@ async def add_admin(
     user: discord.Option(discord.User, description="User to make admin")
 ):
     # Only the bot owner can add admins
-    if ctx.author.id != Config.BOT_OWNER_ID:
+    if ctx.author.id != BOT_OWNER_ID:
         await ctx.respond("❌ Only the bot owner can add admins.")
         return
         
@@ -258,7 +338,7 @@ async def help_cmd(ctx):
         inline=False
     )
     
-    embed.set_footer(text=Config.FOOTER_TEXT)
+    embed.set_footer(text=FOOTER_TEXT)
     await ctx.respond(embed=embed)
 
 # Run the bot
